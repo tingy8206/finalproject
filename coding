@@ -1,0 +1,169 @@
+import time
+import datetime
+from gpiozero import Button, LED
+from gpiozero.pins.lgpio import LGPIOFactory
+
+
+# GPIO pin腳設定
+factory = LGPIOFactory()
+
+pressure = Button(5, pull_up=False, pin_factory=factory)
+
+led_str = LED(18, pin_factory=factory)  # 運作
+led_fall = LED(19, pin_factory=factory) # 跌倒
+
+TRIG_FALL, ECHO_FALL = 27, 22
+
+
+# 設定參數
+VALID_MIN_DIST = 5       # cm
+VALID_MAX_DIST = 100     # cm
+FALL_DISTANCE_DELTA = 12 # cm (變化超過12cm判定跌倒
+LOOP_DELAY = 0.5         # s
+
+STABILITY_COUNT = 5      # 連續測量穩定跳變次數才判定跌倒
+WINDOW_SIZE = 5          # 滑動平均窗口大小
+
+
+# 狀態
+state = "inbed"
+event_count = 0
+start_time = None
+fall_detected = False
+fall_time = None
+fall_baseline = None
+fall_stability_counter = 0
+distance_window = []
+
+
+# 超音波感測器初始化
+trig = LED(TRIG_FALL, pin_factory=factory)
+echo = Button(ECHO_FALL, pull_up=False, pin_factory=factory)
+
+def get_distance():
+    """讀取單次距離，返回 cm 或 None"""
+    trig.off()
+    time.sleep(0.05)
+
+    trig.on()
+    time.sleep(0.00003)  # 30μs脈衝
+    trig.off()
+
+    start = time.time()
+    timeout = start + 0.03
+    while echo.value == 0:
+        if time.time() > timeout:
+            return None
+        start = time.time()
+
+    stop = time.time()
+    timeout = stop + 0.03
+    while echo.value == 1:
+        if time.time() > timeout:
+            return None
+        stop = time.time()
+
+    distance = round((stop - start) * 34300 / 2, 1)
+
+    if VALID_MIN_DIST <= distance <= VALID_MAX_DIST:
+        return distance
+    else:
+        return None
+
+def get_distance_avg(n=3):
+    """取多次平均，增加穩定性"""
+    readings = []
+    for _ in range(n):
+        d = get_distance()
+        if d is not None:
+            readings.append(d)
+        time.sleep(0.01)
+    if readings:
+        return sum(readings) / len(readings)
+    else:
+        return None
+
+#
+# Main loop
+try:
+    while True:
+        now = datetime.datetime.now()
+
+        # inbed
+        if state == "inbed":
+            if pressure.value == 0:  # 壓力=0，離床
+                state = "offbed"
+                event_count += 1
+                start_time = now
+                fall_detected = False
+                fall_time = None
+                fall_stability_counter = 0
+                distance_window.clear()
+
+                led_str.on()
+                led_fall.off()
+
+                # 獲取穩定的基線距離
+                fall_baseline = None
+                while fall_baseline is None:
+                    fall_baseline = get_distance_avg(n=10)  # 平均10次，穩定
+                    if fall_baseline is None:
+                        print("Retrying to get baseline distance...")
+                    time.sleep(0.5)
+
+                print(f"\n=== Event {event_count} START ===")
+                print(f"Baseline distance: {fall_baseline:.1f} cm")
+
+        # offbed
+        elif state == "offbed":
+            d = get_distance_avg()
+            if d is not None:
+                # 更新滑動窗口
+                distance_window.append(d)
+                if len(distance_window) > WINDOW_SIZE:
+                    distance_window.pop(0)
+
+                # 滑動平均
+                avg_distance = sum(distance_window) / len(distance_window)
+                print(f"Measured distance: {avg_distance:.1f} cm")
+
+                # 判斷距離跳變是否超過閾值
+                if fall_baseline is not None:
+                    if avg_distance > fall_baseline + FALL_DISTANCE_DELTA:
+                        fall_stability_counter += 1
+                        print(f"Stability counter: {fall_stability_counter}")
+                    else:
+                        fall_stability_counter = 0
+
+                    if fall_stability_counter >= STABILITY_COUNT and not fall_detected:
+                        fall_detected = True
+                        fall_time = now
+                        led_fall.on()
+                        print("!!! Possible FALL detected !!!")
+
+            # 回床
+            if pressure.value == 1:
+                end_time = now
+                duration = (end_time - start_time).total_seconds()
+
+                led_str.off()
+                led_fall.off()
+
+                print(f"=== Event {event_count} END ===")
+                print({
+                    "start": start_time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "duration_sec": round(duration, 1),
+                    "fall_detected": fall_detected,
+                    "fall_time": fall_time.strftime("%H:%M:%S") if fall_detected else None
+                })
+
+                state = "inbed"
+
+        time.sleep(LOOP_DELAY)
+
+except KeyboardInterrupt:
+    print("Program stopped by user")
+
+finally:
+    led_str.off()
+    led_fall.off()
